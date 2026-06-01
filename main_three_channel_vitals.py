@@ -461,19 +461,6 @@ class MatlabStrictRadarProcessor:
         self.target_range_max_m = 3.00
         self.prev_range_bin0: Optional[int] = None
 
-        # 先测距、再测角、再提取生命体征。
-        # 默认三接收天线为线阵，阵元间距按 λ/2 处理；如果实物板卡间距不是 λ/2，
-        # 需要把 rx_spacing_m 改成实际相位中心间距，否则角度会有比例误差。
-        self.rx_spacing_m = 0.5 * self.lambda_
-        self.angle_min_deg = -60.0
-        self.angle_max_deg = 60.0
-        self.angle_bin_num = 121
-        self.angle_axis_deg = np.linspace(self.angle_min_deg, self.angle_max_deg, self.angle_bin_num)
-        self.angle_recent_frames = 160
-        self.prev_angle_deg: Optional[float] = None
-        # 若实测左右方向与图上相反，把 angle_sign 改为 -1.0。
-        self.angle_sign = 1.0
-
         # 呼吸/心率稳定器：避免瞬时频谱峰跳变直接映射到输出
         self.prev_breath_rate = 0.0
         self.prev_heart_rate = 0.0
@@ -579,146 +566,6 @@ class MatlabStrictRadarProcessor:
 
         self.prev_range_bin0 = candidate
         return candidate
-
-    def _steering_matrix(self, angle_axis_deg: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        三通道线阵角度扫描导向矩阵。
-        返回 shape = [rx_channel, angle_bin]。
-        """
-        if angle_axis_deg is None:
-            angle_axis_deg = self.angle_axis_deg
-        angle_axis_deg = np.asarray(angle_axis_deg, dtype=float)
-        ch_pos = np.arange(3, dtype=float) - 1.0  # 三阵元中心化：[-1, 0, 1]
-        theta = np.deg2rad(angle_axis_deg)
-        phase = (
-            self.angle_sign
-            * 2.0
-            * np.pi
-            * self.rx_spacing_m
-            / max(self.lambda_, np.finfo(float).eps)
-            * np.outer(ch_pos, np.sin(theta))
-        )
-        return np.exp(1j * phase)
-
-    def _compute_range_angle_spectrum(self, avg_all: np.ndarray, rax_plot: np.ndarray) -> tuple[np.ndarray, np.ndarray, int, float, float]:
-        """
-        基于三接收通道 DBF 生成角度-距离谱，并从谱峰定位目标距离和角度。
-        输入 avg_all: [range_bin, slow_time, rx_channel]，已经做过时间均值杂波抑制。
-        返回: range_angle_db[R,A], angle_axis_deg[A], target_range_bin0, target_angle_deg, target_peak_db。
-        """
-        range_num, slow_num, ch_num = avg_all.shape
-        if ch_num < 2 or range_num == 0:
-            ra_db = np.zeros((range_num, self.angle_bin_num), dtype=float)
-            return ra_db, self.angle_axis_deg.copy(), 0, 0.0, 0.0
-
-        recent_len = min(self.angle_recent_frames, slow_num)
-        if recent_len <= 0:
-            ra_db = np.zeros((range_num, self.angle_bin_num), dtype=float)
-            return ra_db, self.angle_axis_deg.copy(), 0, 0.0, 0.0
-
-        recent = avg_all[:, -recent_len:, :]
-        steering = self._steering_matrix(self.angle_axis_deg)  # [C,A]
-
-        # 常规波束形成。beam[R,T,A] = Σ_c x[R,T,c] * conj(a[c,A])。
-        beam = np.einsum('rtc,ca->rta', recent, np.conj(steering), optimize=True) / max(ch_num, 1)
-        ra_power = np.mean(np.abs(beam) ** 2, axis=1)  # [R,A]
-        ra_db = safe_db(np.sqrt(ra_power))
-
-        valid_range = (rax_plot >= self.target_range_min_m) & (rax_plot <= self.target_range_max_m)
-        if valid_range.size != range_num:
-            valid_range = np.ones(range_num, dtype=bool)
-        if not np.any(valid_range):
-            valid_range = np.ones(range_num, dtype=bool)
-
-        search_power = np.where(valid_range[:, None], ra_power, 0.0)
-        flat_idx = int(np.argmax(search_power))
-        cand_range, cand_angle = np.unravel_index(flat_idx, search_power.shape)
-
-        # 距离和角度双维稳定：上一帧附近的峰值足够强时优先保持，避免图上目标点跳变。
-        if self.prev_range_bin0 is not None and self.prev_angle_deg is not None:
-            r0 = int(self.prev_range_bin0)
-            a0 = int(np.argmin(np.abs(self.angle_axis_deg - float(self.prev_angle_deg))))
-            r_lo = max(0, r0 - 3)
-            r_hi = min(range_num, r0 + 4)
-            a_lo = max(0, a0 - 8)
-            a_hi = min(self.angle_bin_num, a0 + 9)
-            local = search_power[r_lo:r_hi, a_lo:a_hi]
-            if local.size > 0:
-                local_flat = int(np.argmax(local))
-                local_r, local_a = np.unravel_index(local_flat, local.shape)
-                local_r += r_lo
-                local_a += a_lo
-                if search_power[local_r, local_a] >= 0.58 * max(search_power[cand_range, cand_angle], np.finfo(float).eps):
-                    cand_range, cand_angle = local_r, local_a
-
-        target_angle_deg = float(self.angle_axis_deg[cand_angle])
-        target_peak_db = float(ra_db[cand_range, cand_angle])
-        self.prev_range_bin0 = int(cand_range)
-        self.prev_angle_deg = target_angle_deg
-        return ra_db, self.angle_axis_deg.copy(), int(cand_range), target_angle_deg, target_peak_db
-
-    def _extract_fused_phase_by_range_angle(
-        self,
-        avg_all: np.ndarray,
-        target_bin0: int,
-        target_angle_deg: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        按“已定位的距离 + 已定位的角度”提取目标复数慢时间序列，再估计胸腔微动相位。
-        生命体征主通道采用目标方向的波束形成信号，三个单通道相位仍保留用于心率冗余校验。
-        """
-        n = avg_all.shape[1]
-        ch_num = avg_all.shape[2]
-        target_bin0 = int(np.clip(target_bin0, 0, avg_all.shape[0] - 1))
-
-        steering = self._steering_matrix(np.asarray([target_angle_deg], dtype=float))[:, 0]
-        z_multi = avg_all[target_bin0, :, :]  # [T,C]
-        z_bf = (z_multi @ np.conj(steering[:ch_num])) / max(ch_num, 1)
-        fused = self._preprocess_phase_from_complex(z_bf)
-
-        channel_phase = np.zeros((n, ch_num), dtype=float)
-        q = np.zeros(ch_num, dtype=float)
-        for ch in range(ch_num):
-            z = z_multi[:, ch]
-            sig = self._preprocess_phase_from_complex(z)
-            channel_phase[:, ch] = sig
-
-            amp_target = np.abs(z[-min(120, n):])
-            noise_floor = np.median(np.abs(avg_all[:, -min(120, n):, ch])) + np.finfo(float).eps
-            snr_like = float(np.median(amp_target) / noise_floor)
-            phase_power = float(np.std(sig))
-            if phase_power < 1e-8:
-                snr_like = 0.0
-            q[ch] = max(0.0, snr_like)
-
-        # 如果波束形成相位极弱，退回原三通道相位加权融合，避免目标正好落在阵列零陷时输出全零。
-        if float(np.std(fused)) < 1e-8:
-            fused_old, channel_phase_old, weights_old = self._extract_fused_phase(avg_all, target_bin0)
-            return fused_old, channel_phase_old, weights_old
-
-        # 单通道心率候选仍然做符号一致性处理。
-        ref_ch = int(np.argmax(q)) if np.any(q > 0) else 0
-        ref = channel_phase[:, ref_ch]
-        for ch in range(ch_num):
-            if ch == ref_ch:
-                continue
-            a = ref[-min(160, n):]
-            b = channel_phase[-min(160, n):, ch]
-            if np.std(a) > 1e-8 and np.std(b) > 1e-8:
-                corr = float(np.corrcoef(a, b)[0, 1])
-                if np.isfinite(corr) and corr < -0.15:
-                    channel_phase[:, ch] *= -1.0
-                elif (not np.isfinite(corr)) or abs(corr) < 0.05:
-                    q[ch] *= 0.45
-
-        if np.sum(q) <= np.finfo(float).eps:
-            weights = np.ones(ch_num, dtype=float) / ch_num
-        else:
-            weights = np.clip(q, 0.0, np.percentile(q, 90) + np.finfo(float).eps)
-            weights = weights / max(float(np.sum(weights)), np.finfo(float).eps)
-
-        fused = fused - np.median(fused)
-        return fused, channel_phase, weights
 
     def _extract_fused_phase(self, avg_all: np.ndarray, target_bin0: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -917,19 +764,14 @@ class MatlabStrictRadarProcessor:
         else:
             avg_all = np.zeros_like(rx_rpc)
 
-        # 保留原时间-距离谱供调试，同时新增角度-距离谱作为第一幅图显示。
+        # 显示用三通道非相干融合 MTI 图。
         mti_mag = np.sqrt(np.sum(np.abs(avg_all) ** 2, axis=2))
         db_avg = safe_db(mti_mag)
 
-        # 算法顺序：先测距 + 测角，再在该距离/角度单元上提取胸腔微动相位。
-        range_angle_db, angle_axis_deg, max_range_bin0, target_angle_deg, target_ra_db = self._compute_range_angle_spectrum(
-            avg_all, rax_plot
-        )
+        max_range_bin0 = self._select_target_range_bin(avg_all, rax_plot)
         max_range_bin1 = max_range_bin0 + 1
 
-        fused_phase, channel_phase, channel_weights = self._extract_fused_phase_by_range_angle(
-            avg_all, max_range_bin0, target_angle_deg
-        )
+        fused_phase, channel_phase, channel_weights = self._extract_fused_phase(avg_all, max_range_bin0)
 
         # 相位变化换算为位移变化，主要用于调试/保存；生命体征滤波仍使用相位量。
         filt_phase_magnitude = fused_phase * self.lambda_ / (4.0 * np.pi)
@@ -948,16 +790,12 @@ class MatlabStrictRadarProcessor:
 
         return {
             "range_m": target_range_m,
-            "angle_deg": float(target_angle_deg),
             "range_bin_index": max_range_bin1,
             "breath_bpm": float(breathing_rate),
             "heart_bpm": float(heart_rate_bpm),
             "t_plot": t_plot,
             "rax_plot": rax_plot,
             "mti_db": db_avg,
-            "range_angle_db": range_angle_db,
-            "angle_axis_deg": angle_axis_deg,
-            "target_ra_db": float(target_ra_db),
             "magnitude": filt_phase_magnitude,
             "breath_signal": data_out_phase_breath,
             "breath_locs": locs,
@@ -1030,12 +868,11 @@ class RadarMatlabStrictApp:
         metrics.pack(side=tk.TOP, fill=tk.X)
         self.range_bin_var = tk.StringVar(value="最大距离门的索引是: ")
         self.range_var = tk.StringVar(value="目标距离: ")
-        self.angle_var = tk.StringVar(value="目标角度: ")
         self.breath_var = tk.StringVar(value="呼吸: ")
         self.heart_var = tk.StringVar(value="心率: ")
         self.finger_hr_var = tk.StringVar(value="心电仪心率: ")
         self.diff_var = tk.StringVar(value="心率差值: ")
-        for idx, var in enumerate([self.range_bin_var, self.range_var, self.angle_var, self.breath_var, self.heart_var,
+        for idx, var in enumerate([self.range_bin_var, self.range_var, self.breath_var, self.heart_var,
                                    self.finger_hr_var, self.diff_var]):
             ttk.Label(metrics, textvariable=var, foreground="#1f77b4", font=("Microsoft YaHei", 12, "bold")).grid(
                 row=0, column=idx, padx=8, pady=4, sticky="w"
@@ -1050,7 +887,7 @@ class RadarMatlabStrictApp:
 
         self.ax_breath.set_title("呼吸波形", pad=10)
         self.ax_heart.set_title("心跳波形", pad=10)
-        self.ax_mti.set_title("角度-距离谱", pad=8)
+        self.ax_mti.set_title("时间距离谱", pad=8)
         self.ax_compare.set_title("雷达心率与心电仪心率对比", pad=8)
 
         self.ax_breath.set_xlabel("时间")
@@ -1063,7 +900,7 @@ class RadarMatlabStrictApp:
         self.ax_heart.set_ylim(-1.5, 1.5)
         self.ax_heart.grid(True)
 
-        self.ax_mti.set_xlabel("角度 (deg)")
+        self.ax_mti.set_xlabel("时间 (s)")
         self.ax_mti.set_ylabel("距离 (m)")
         self.ax_mti.set_ylim(0, 5)
         self.ax_mti.grid(True)
@@ -1198,7 +1035,6 @@ class RadarMatlabStrictApp:
 
         self.range_bin_var.set(f"最大距离门的索引是: {result['range_bin_index']}")
         self.range_var.set(f"目标距离: {result['range_m']:.2f} m")
-        self.angle_var.set(f"目标角度: {result['angle_deg']:+.1f}°")
         self.breath_var.set(f"呼吸: {breath_bpm:.2f}")
         self.heart_var.set(f"心率: {heart_bpm:.2f}")
         self.finger_hr_var.set("心电仪心率: N/A" if finger_hr is None else f"心电仪心率: {finger_hr:.2f}")
@@ -1206,50 +1042,21 @@ class RadarMatlabStrictApp:
 
         t_plot = result["t_plot"]
         rax_plot = result["rax_plot"]
-        range_angle_db = result["range_angle_db"]
-        angle_axis_deg = result["angle_axis_deg"]
+        mti_db = result["mti_db"]
 
         self.ax_mti.clear()
-        if range_angle_db.size > 0 and angle_axis_deg.size > 0 and rax_plot.size > 0:
-            finite_ra = range_angle_db[np.isfinite(range_angle_db)]
-            if finite_ra.size > 0:
-                vmin = float(np.percentile(finite_ra, 10))
-                vmax = float(np.percentile(finite_ra, 99))
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
-            else:
-                vmin, vmax = 40.0, 130.0
-            self.ax_mti.imshow(
-                range_angle_db,
-                origin='lower',
-                aspect='auto',
-                extent=[angle_axis_deg[0], angle_axis_deg[-1], rax_plot[0], rax_plot[-1]],
-                cmap='jet',
-                vmin=vmin,
-                vmax=vmax,
-            )
-            self.ax_mti.scatter(
-                [result["angle_deg"]],
-                [result["range_m"]],
-                marker='o',
-                s=70,
-                facecolors='none',
-                edgecolors='white',
-                linewidths=1.8,
-            )
-            self.ax_mti.annotate(
-                f"R={result['range_m']:.2f}m\nA={result['angle_deg']:+.1f}°",
-                xy=(result["angle_deg"], result["range_m"]),
-                xytext=(8, 8),
-                textcoords='offset points',
-                color='white',
-                fontsize=9,
-                bbox=dict(boxstyle='round,pad=0.25', fc='black', alpha=0.45),
-            )
-        self.ax_mti.set_title("角度-距离谱")
-        self.ax_mti.set_xlabel("角度 (deg)")
+        self.ax_mti.imshow(
+            mti_db,
+            origin='lower',
+            aspect='auto',
+            extent=[0.0 if len(t_plot) == 0 else t_plot[0], 0.0 if len(t_plot) == 0 else t_plot[-1], rax_plot[0], rax_plot[-1]],
+            cmap='jet',
+            vmin=40,
+            vmax=130,
+        )
+        self.ax_mti.set_title("时间距离谱")
+        self.ax_mti.set_xlabel("时间 (s)")
         self.ax_mti.set_ylabel("距离 (m)")
-        self.ax_mti.set_xlim(self.radar_processor.angle_min_deg if self.radar_processor else -60, self.radar_processor.angle_max_deg if self.radar_processor else 60)
         self.ax_mti.set_ylim(0, 5)
         self.ax_mti.grid(True)
 
@@ -1298,7 +1105,7 @@ class RadarMatlabStrictApp:
         diff_text = "N/A" if diff is None else f"{diff:+.2f}"
         finger_text = "N/A" if finger_hr is None else f"{finger_hr:5.2f}"
         self._append_status(
-            f"[{ts()}] 目标距离: {result['range_m']:5.2f} m   目标角度: {result['angle_deg']:+5.1f}°   雷达呼吸: {breath_bpm:5.2f}   雷达心率: {heart_bpm:5.2f}   心电仪心率: {finger_text}   心率差值: {diff_text}"
+            f"[{ts()}] 目标距离: {result['range_m']:5.2f} m   雷达呼吸: {breath_bpm:5.2f}   雷达心率: {heart_bpm:5.2f}   心电仪心率: {finger_text}   心率差值: {diff_text}"
         )
 
     def on_close(self):
