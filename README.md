@@ -2,6 +2,8 @@
 
 基于 Python 的 60GHz FMCW 雷达单人呼吸率与心率实时检测程序。
 
+硬件使用RS6013B,详情请见链接：https://mp.weixin.qq.com/s/Z0pV2eZGnF2bSK__397slw
+
 本项目面向单人近距离生命体征检测场景，通过串口读取 60GHz FMCW 雷达三接收通道数据，完成数据解包、距离维 FFT、静态杂波抑制、目标距离门选择、三通道相位融合、呼吸率估计、心率估计，并提供 Tkinter + Matplotlib 图形界面进行实时显示。同时，程序支持通过 USB HID 读取指夹式心率/血氧仪数据，用于和雷达心率结果进行对比验证。
 
 > 注意：当前工程虽然仓库名中包含 `MATLAB Code`，但本脚本实际是 Python 程序。脚本中部分类名和注释保留了 MATLAB 迁移痕迹，例如 `MatlabStrictRadarProcessor`、`Radra_Data` 等。
